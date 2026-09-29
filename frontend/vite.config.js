@@ -13,9 +13,10 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'https://88shangcheng.top',
+        // 本地测试后端（协同开发约定）。生产域名 88shangcheng.top 严禁改动。
+        target: 'http://127.0.0.1:8899',
         changeOrigin: true,
-        secure: true,
+        secure: false,
       },
     },
   },
