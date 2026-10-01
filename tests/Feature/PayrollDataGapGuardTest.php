@@ -8,17 +8,16 @@ use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 
 /**
- * 核算护栏（2026-10-01，Task 1）：薪资基数缺失（fixed_monthly==0 &&
- * base_salary==0）且当月有实际出勤的人员，不再静默生成 0 工资行——
- * 适用范围由「仅离职」扩展到所有人员：跳过核算并进入 missing danger
- * 清单（姓名+项目），提示去钉钉花名册补录/检查同步后重算。
- * 仅有考勤行但实际出勤为 0（整月公休）者不在跳过范围，正常出行。
+ * 数据缺失护栏（2026-10-01，Task 1）：
+ *   - 单项基数为 0（固定月薪/基本工资只缺一项）不属于缺失，正常核算；
+ *   - 两项均为 0 且有实际出勤 → 跳过核算进 missing danger（与正常人员同项目互不影响）；
+ *   - 两项均为 0 但考勤表中根本无此人 → 沿用原「无考勤记录」missing info 路径。
  */
-class PayrollResignGuardTest extends TestCase
+class PayrollDataGapGuardTest extends TestCase
 {
     use RefreshDatabase;
 
-    private const YM = '2026-06';
+    private const YM = '2026-07';
 
     private function seedRules(): void
     {
@@ -61,18 +60,17 @@ class PayrollResignGuardTest extends TestCase
         return $out;
     }
 
-    /** person_type=null 模拟钉钉离职列表新建占位行的真实形态 */
-    private function seedStaff(int $id, string $name, float $fixed, float $base, string $status = '离职', $personType = null): void
+    private function seedStaff(int $id, string $name, float $fixed, float $base, string $status = '正式', $personType = 'staff'): void
     {
         DB::table('payroll_staff')->insert([
             'legacy_id' => $id, 'name' => $name, 'project_name' => '测试项目', 'position' => '测试岗',
             'status' => $status, 'fixed_monthly' => $fixed, 'base_salary' => $base,
-            'hire_date' => '2026-01-01', 'resign_date' => $status === '离职' ? '2026-06-15' : null,
+            'hire_date' => '2026-01-01', 'resign_date' => null,
             'deleted' => false, 'person_type' => $personType,
             'data' => json_encode([
                 'salary_history' => [['effective_date' => '2026-01-01', 'fixed_monthly' => $fixed, 'base_salary' => $base, 'type' => '初始', 'note' => '']],
                 'special_deductions' => [],
-                'regular_date' => '', 'resign_date' => $status === '离职' ? '2026-06-15' : '',
+                'regular_date' => '', 'resign_date' => '',
             ], JSON_UNESCAPED_UNICODE),
             'created_at' => now(), 'updated_at' => now(),
         ]);
@@ -89,10 +87,10 @@ class PayrollResignGuardTest extends TestCase
         ];
     }
 
-    /** 6月30天：前20天出勤 */
+    /** 7月31天：前20天出勤 */
     private function workedDays(): array
     {
-        $d = array_fill(0, 30, '休');
+        $d = array_fill(0, 31, '休');
         for ($i = 0; $i < 20; $i++) $d[$i] = '√';
         return $d;
     }
@@ -112,66 +110,57 @@ class PayrollResignGuardTest extends TestCase
         return ['rows' => $out, 'result' => $result];
     }
 
-    public function test_resigned_with_attendance_but_zero_base_is_skipped_to_missing(): void
+    public function test_single_zero_base_with_attendance_is_calculated_normally(): void
     {
+        // 仅基本工资一项为 0（固定月薪 5000）：不属于基数缺失，正常出行
         $this->seedRules();
-        $this->seedStaff(1, '张传彩', 0, 0);
+        $this->seedStaff(1, '钱七', 5000, 0);
 
-        $r = $this->calc(['张传彩' => $this->makeAtt($this->workedDays())]);
-
-        // 基数缺失且有出勤：不得生成工资行，进 missing danger 清单提示补录钉钉花名册
-        $this->assertSame(0, $r['result']['count']);
-        $this->assertNotEmpty($r['result']['missing']);
-        $m = $r['result']['missing'][0];
-        $this->assertSame('张传彩', $m['name']);
-        $this->assertSame('测试项目', $m['project']);
-        $this->assertSame('danger', $m['level']);
-        $this->assertStringContainsString('钉钉花名册', $m['reason']);
-        $this->assertArrayNotHasKey(1, $r['rows']);
-        $this->assertSame([], $r['result']['warnings']);
-    }
-
-    public function test_resigned_with_normal_base_has_no_warning(): void
-    {
-        $this->seedRules();
-        $this->seedStaff(1, '李四', 6000, 5000);
-
-        $r = $this->calc(['李四' => $this->makeAtt($this->workedDays())]);
-
-        $this->assertSame(1, $r['result']['count']);
-        $this->assertSame([], $r['result']['warnings']);
-    }
-
-    public function test_resigned_zero_base_no_attendance_produces_no_danger_warning(): void
-    {
-        // 有考勤行但整月全公休（actual=0）：不属于「无考勤行」missing 路径，正常出行
-        $this->seedRules();
-        $this->seedStaff(1, '王五', 0, 0);
-
-        $r = $this->calc(['王五' => $this->makeAtt(array_fill(0, 30, '休'))]);
+        $r = $this->calc(['钱七' => $this->makeAtt($this->workedDays())]);
 
         $this->assertSame(1, $r['result']['count']);
         $this->assertSame([], $r['result']['missing']);
+        $this->assertSame([], $r['result']['warnings']);
         $this->assertArrayHasKey(1, $r['rows']);
-        // 注意：不断言 warnings 为空（下一任务会让该场景产生 1 条 info warning）
     }
 
-    public function test_active_staff_zero_base_with_attendance_is_skipped_to_missing(): void
+    public function test_zero_base_staff_skipped_while_normal_staff_calculated(): void
     {
-        // 护栏范围扩展到在职人员：0/0 且有出勤同样跳过并进 danger 清单
+        // 0/0 人员与正常人员混在同一项目：仅正常人出行，缺失者进 danger 清单
         $this->seedRules();
-        $this->seedStaff(1, '赵六', 0, 0, '正式', 'staff');
+        $this->seedStaff(1, '孙八', 0, 0);
+        $this->seedStaff(2, '李四', 6000, 5000);
 
-        $r = $this->calc(['赵六' => $this->makeAtt($this->workedDays())]);
+        $r = $this->calc([
+            '孙八' => $this->makeAtt($this->workedDays()),
+            '李四' => $this->makeAtt($this->workedDays()),
+        ]);
+
+        $this->assertSame(1, $r['result']['count']);
+        $this->assertCount(1, $r['result']['missing']);
+        $m = $r['result']['missing'][0];
+        $this->assertSame('孙八', $m['name']);
+        $this->assertSame('danger', $m['level']);
+        $this->assertArrayNotHasKey(1, $r['rows']);
+        $this->assertArrayHasKey(2, $r['rows']);
+        $this->assertSame([], $r['result']['warnings']);
+    }
+
+    public function test_zero_base_staff_without_attendance_row_keeps_info_missing(): void
+    {
+        // 考勤表中根本无此人：沿用原「无考勤记录」info 路径，不是 danger，也不涉薪资缺失文案
+        $this->seedRules();
+        $this->seedStaff(1, '周九', 0, 0);
+
+        $r = $this->calc([]);
 
         $this->assertSame(0, $r['result']['count']);
-        $this->assertNotEmpty($r['result']['missing']);
+        $this->assertCount(1, $r['result']['missing']);
         $m = $r['result']['missing'][0];
-        $this->assertSame('赵六', $m['name']);
-        $this->assertSame('danger', $m['level']);
-        $this->assertStringContainsString('钉钉', $m['reason']);
-        $this->assertStringNotContainsString('离职', $m['reason']);
+        $this->assertSame('周九', $m['name']);
+        $this->assertSame('info', $m['level']);
+        $this->assertStringContainsString('考勤', $m['reason']);
+        $this->assertStringNotContainsString('薪资数据缺失', $m['reason']);
         $this->assertArrayNotHasKey(1, $r['rows']);
-        $this->assertSame([], $r['result']['warnings']);
     }
 }
