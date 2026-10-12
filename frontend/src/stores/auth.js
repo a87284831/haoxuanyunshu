@@ -1,0 +1,98 @@
+import { defineStore } from 'pinia'
+import { api } from '@/api/client'
+import router from '@/router'
+
+// 进行中的会话恢复请求（模块级，跨 store 实例去重；守卫并发触发时只发一次 /api/init）
+let bootPromise = null
+
+export const useAuthStore = defineStore('auth', {
+  state: () => ({
+    user: null,
+    token: '',
+    // 权限点集合（复刻旧版 bootstrap() 的聚合逻辑，由 hydrate() 填充）
+    perms: [],
+    appModules: [],
+    // 项目列表（复刻 state.projects，由 /api/init 提供）
+    projects: [],
+    // 角色与系统设置（复刻 state.roles / state.settings，由 /api/init 提供）
+    roles: [],
+    settings: {},
+  }),
+  getters: {
+    // 复刻 canPerm(mod)：admin 全通过，否则按权限点集合判断；空串=所有人可见
+    can: (state) => (perm) => {
+      if (!perm) return true
+      if (state.user && state.user.role === 'admin') return true
+      return state.perms.includes(perm)
+    },
+  },
+  actions: {
+    async login(username, password) {
+      const data = await api('/api/login', { body: { username, password } })
+      this.token = data.token
+      this.user = data.user || null
+      sessionStorage.setItem('gw_token', data.token)
+    },
+    async logout() {
+      api('/api/logout').catch(() => {})
+      this.token = ''
+      this.user = null
+      sessionStorage.removeItem('gw_token')
+      router.push('/login')
+    },
+    restore() {
+      const t = sessionStorage.getItem('gw_token')
+      if (t) this.token = t
+    },
+    // 深链/刷新场景：守卫在 MainLayout 挂载前执行，必须先确保 user 就绪再判权限。
+    // 有 token 缺 user 时拉 /api/init 并 hydrate；并发调用复用同一 Promise。
+    async ensureReady() {
+      this.restore()
+      if (!this.token || this.user) return
+      if (!bootPromise) {
+        bootPromise = api('/api/init')
+          .then((data) => {
+            this.hydrate(data)
+            bootPromise = null
+          })
+          .catch((e) => {
+            bootPromise = null
+            throw e
+          })
+      }
+      return bootPromise
+    },
+    // 复刻旧版 refreshProjects（app.js:4541）：项目档案变更后同步全局项目列表
+    async refreshProjects() {
+      try {
+        const data = await api('/api/init')
+        this.projects = data.projects || []
+      } catch (e) { /* 忽略：保留旧列表 */ }
+    },
+    // 复刻旧版 bootstrap() 中权限点聚合（app.js:122-135）
+    hydrate(data) {
+      this.user = data.user
+      this.projects = data.projects || []
+      this.appModules = data.app_modules || []
+      this.roles = data.roles || []
+      this.settings = data.settings || {}
+      const permSet = []
+      const add = (p) => {
+        if (!permSet.includes(p)) permSet.push(p)
+      }
+      if (data.user && data.user.role === 'admin') {
+        this.appModules.forEach((m) => (m.perms || []).forEach((p) => add(p[0])))
+      } else {
+        const roles = data.roles || []
+        const r = roles.find((x) => x.id === data.user.role || x.role_key === data.user.role || (x.data && x.data.id === data.user.role))
+        const rp = (r && (r.perms || (r.permissions ? JSON.parse(r.permissions) : []))) || []
+        if (rp.includes('*')) {
+          this.appModules.forEach((m) => (m.perms || []).forEach((p) => add(p[0])))
+        } else {
+          rp.forEach(add)
+        }
+      }
+      this.perms = permSet
+    },
+  },
+})
